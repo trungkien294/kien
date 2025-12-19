@@ -93,8 +93,10 @@ void TaskSensorCode(void * parameter) {
         long irRaw = particleSensor.getFIFOIR();
         long redRaw = particleSensor.getFIFORed();
         particleSensor.nextSample(); 
+          Serial.print("IR Value: ");
+          Serial.println(irRaw); 
 
-        if (irRaw < 50000) { 
+        if (irRaw < 7000) { 
            handDetected = false;
            shared_IR_Filtered = 0;
            shared_BPM = 0;
@@ -138,7 +140,8 @@ void TaskSensorCode(void * parameter) {
               float sum = 0;
               for (int i=0; i<intervalsCount; i++) sum += recentIntervals[i];
               float mean = sum / intervalsCount;
-              currentBPM = 60.0 / mean;
+              currentBPM = 60.0 / mean; // tính Bpm thô
+              //
               tone(BUZZER_PIN, 2000, 50); 
            }
            isPeak = true;
@@ -150,8 +153,8 @@ void TaskSensorCode(void * parameter) {
         float R = (fabs(ac_red) / dc_red) / (fabs(ac_ir) / dc_ir);
         if (R > 0.2 && R < 3.0) { 
            avgR = 0.98 * avgR + 0.02 * R; 
-           float spo2 = 110.0 - 25.0 * avgR;
-           spo2 = constrain(spo2, 80, 100);
+           float spo2 = 107.0 - 14.0 * avgR;
+           spo2 = constrain(spo2, 0, 100);
            currentSpO2 = spo2;
         }
         shared_BPM = shared_BPM * 0.9 + currentBPM * 0.1;
@@ -192,7 +195,7 @@ void setup() {
   
   // Tự động kết nối. Nếu thất bại sẽ tạo AP tên "ESP32_Pulse_Config"
   // Sau 60s không ai cấu hình, nó sẽ tiếp tục chạy offline
-  wm.setConfigPortalTimeout(60); 
+  wm.setConfigPortalTimeout(30); 
 
   if(!wm.autoConnect("ESP32_Pulse_Config")) {
     Serial.println("Khong ket noi duoc WiFi - Chay che do Offline");
