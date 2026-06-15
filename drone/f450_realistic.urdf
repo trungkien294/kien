@@ -1,0 +1,64 @@
+<?xml version="1.0"?>
+<robot name="f450_tower_drone">
+
+  <material name="black"> <color rgba="0.15 0.15 0.15 1.0"/> </material>
+  <material name="white"> <color rgba="0.9 0.9 0.9 1.0"/> </material>
+  <material name="red"> <color rgba="0.8 0.1 0.1 1.0"/> </material>
+  <material name="silver"> <color rgba="0.6 0.6 0.6 1.0"/> </material>
+  <material name="gold"> <color rgba="0.85 0.65 0.15 1.0"/> </material> 
+  <material name="prop_trans"> <color rgba="0.1 0.1 0.1 0.4"/> </material>
+  <material name="lidar_blue"> <color rgba="0.1 0.4 0.9 1.0"/> </material>
+
+  <link name="base_link"/>
+
+  <link name="khung_den">
+    <visual>
+      <origin xyz="0 0 0" rpy="1.5708 0 0"/><geometry><mesh filename="file:///home/kien/khung_den.stl" scale="0.001 0.001 0.001"/></geometry>
+      <material name="black"/>
+    </visual>
+  </link>
+  <joint name="khung_joint" type="fixed">
+    <parent link="base_link"/> <child link="khung_den"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <link name="tru_vang">
+    <visual>
+      <origin xyz="0 0 0" rpy="1.5708 0 0"/><geometry><mesh filename="file:///home/kien/tru_vang.stl" scale="0.001 0.001 0.001"/></geometry>
+      <material name="gold"/>
+    </visual>
+  </link>
+  <joint name="tru_joint" type="fixed">
+    <parent link="base_link"/> <child link="tru_vang"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <link name="tay_do">
+    <visual><origin xyz="0 0 0" rpy="1.5708 0 0"/> <geometry><mesh filename="file:///home/kien/tay_do.stl" scale="0.001 0.001 0.001"/></geometry> <material name="red"/> </visual>
+  </link>
+  <joint name="tay_do_joint" type="fixed"> <parent link="base_link"/> <child link="tay_do"/> <origin xyz="0 0 0" rpy="0 0 0"/> </joint>
+
+  <link name="tay_trang">
+   <visual><origin xyz="0 0 0" rpy="1.5708 0 0"/> <geometry><mesh filename="file:///home/kien/tay_trang.stl" scale="0.001 0.001 0.001"/></geometry> <material name="white"/> </visual>
+  </link>
+  <joint name="tay_trang_joint" type="fixed"> <parent link="base_link"/> <child link="tay_trang"/> <origin xyz="0 0 0" rpy="0 0 0"/> </joint>
+
+  <link name="motor_bac">
+   <visual><origin xyz="0 0 0" rpy="1.5708 0 0"/> <geometry><mesh filename="file:///home/kien/motor_bac.stl" scale="0.001 0.001 0.001"/></geometry> <material name="silver"/> </visual>
+  </link>
+  <joint name="motor_joint" type="fixed"> <parent link="base_link"/> <child link="motor_bac"/> <origin xyz="0 0 0" rpy="0 0 0"/> </joint>
+
+  <link name="canh_trong">
+    <visual><origin xyz="0 0 0" rpy="1.5708 0 0"/> <geometry><mesh filename="file:///home/kien/canh_trong.stl" scale="0.001 0.001 0.001"/></geometry> <material name="prop_trans"/> </visual>
+  </link>
+  <joint name="canh_joint" type="fixed"> <parent link="base_link"/> <child link="canh_trong"/> <origin xyz="0 0 0" rpy="0 0 0"/> </joint>
+
+  <link name="laser_frame">
+    <visual><origin xyz="0 0 0" rpy="1.5708 0 0"/> <geometry><mesh filename="file:///home/kien/x3_lidar.stl" scale="0.001 0.001 0.001"/></geometry> <material name="lidar_blue"/> </visual>
+  </link>
+  <joint name="lidar_joint" type="fixed"> 
+    <parent link="base_link"/> <child link="laser_frame"/> 
+    <origin xyz="0 0 0" rpy="0 0 0"/> 
+  </joint>
+
+</robot>
