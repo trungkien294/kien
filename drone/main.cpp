@@ -1,13 +1,3 @@
-/*
-  main.cpp - ESP32 flight controller
-  Giả định / lưu ý:
-  - UART MTF02: RX=GPIO17, TX=GPIO15, baud 115200, protocol MSPv2 .
-  - Cảm biến IMU tại địa chỉ 0x68, đọc thanh ghi kiểu MPU6050/ICM 
-  - Accelerometer scale: mặc định ±2g => 16384 LSB/g. // tránh sai scale gây drift góc
-  - Gyro scale: dùng hệ số 0.00763358 deg/s/LSB như code gốc (tương đương ±250 dps). // giữ tương thích với tune cũ
-  - Thuật toán giữ vị trí/độ cao được cập nhật theo hướng của báo cáo optical-flow: bù gyro cho flow, bù ToF theo tilt, cascade position->velocity->acceleration->angle và altitude->climb-rate->throttle.
-*/
-
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_BMP280.h>
@@ -17,6 +7,7 @@
 #include <HardwareSerial.h>
 
 // ================= HARDWARE =================
+// NOTE: Khai báo chân phần cứng: I2C IMU/BMP280, motor ESC, lidar, MTF02.
 #define I2C_SDA_PIN 8
 #define I2C_SCL_PIN 9
 #define ICM_ADDR 0x68
@@ -43,6 +34,7 @@ WebServer server(80);
 Adafruit_BMP280 *bmp;
 
 // ================= FLIGHT STATE =================
+// NOTE: Các biến lệnh bay hiện tại: throttle, roll/pitch/yaw setpoint, arm, H, land, hold.
 float throttle = 1000.0f;
 float r_set = 0.0f;
 float p_set = 0.0f;
@@ -58,6 +50,7 @@ unsigned long last_debug_time = 0;
 unsigned long last_cmd_time = 0;
 
 // ================= MTF02 RAW =================
+// NOTE: Dữ liệu raw từ MTF02 gồm khoảng cách z, vận tốc optical flow x/y và quality.
 float mtf_distance = 0.0f;  // khoảng cách raw từ MTF02
 float mtf_vel_x = 0.0f;     // vận tốc X sau lọc
 float mtf_vel_y = 0.0f;     // vận tốc Y sau lọc
@@ -77,6 +70,7 @@ float flow_ma_sum_y = 0.0f;
 int flow_ma_idx = 0;
 
 // ================= IMU + ATTITUDE PID =================
+// NOTE: Nhóm biến cân bằng thân drone: roll/pitch/yaw, gyro/acc filter, PID góc/tốc độ góc.
 float roll_f = 0.0f;
 float pitch_f = 0.0f;
 float yaw_est = 0.0f;  // yaw tương đối từ gyro để đổi BF<->RF khi giữ vị trí
@@ -105,9 +99,15 @@ float R_angle = 0.0f;
 
 float Kp_angle_rp = 4.5f;
 
-float Kp_rate_rp = 0.60f;
-float Ki_rate_rp = 0.030f;
+float Kp_rate_rp = 0.65f;
+float Ki_rate_rp = 0.02f;
 float Kd_rate_rp = 0.055f;
+
+// ================= TRIM BÙ LỆCH CƠ KHÍ =================
+// NOTE: Dùng khi drone lệch đều một phía dù không có lệnh lái; chỉnh từng 0.2-0.3 độ.
+// Đơn vị: độ. Roll dương=bù nghiêng phải, Pitch dương=bù nghiêng về trước
+float ROLL_TRIM_DEG  = 0.0f;
+float PITCH_TRIM_DEG = 0.0f;
 
 float r_i = 0.0f;
 float p_i = 0.0f;
@@ -122,21 +122,22 @@ float Kd_rate_yaw = 0.0f;
 float y_i = 0.0f;
 float y_prev_rate_e = 0.0f;
 
-float D_ALPHA = 0.08f;
+float D_ALPHA = 0.06f;
 float r_d_fil = 0.0f;
 float p_d_fil = 0.0f;
 float y_d_fil = 0.0f;
 
-float GYRO_LPF_ALPHA = 0.30f;
-float ACC_LPF_ALPHA = 0.18f;
+float GYRO_LPF_ALPHA = 0.3f;
+float ACC_LPF_ALPHA = 0.12f;
 
 float ACC_NORM_MIN = 0.65f;
 float ACC_NORM_MAX = 1.45f;
 float ACC_LSB_PER_G = 16384.0f;   // giả định mặc định ±2g
-float ATT_GYRO_WEIGHT = 0.985f;   // complementary filter: tin gyro ngắn hạn
-float GYRO_DEADBAND_DPS = 0.12f;  // cắt trôi gyro nhỏ khi đứng yên
+float ATT_GYRO_WEIGHT = 0.988f;   // complementary filter: tin gyro ngắn hạn
+float GYRO_DEADBAND_DPS = 0.1f;  // cắt trôi gyro nhỏ khi đứng yên
 
 // ================= KF / NAV STATE =================
+// NOTE: Kalman 1D cho từng trục để ước lượng vị trí/vận tốc từ MTF02.
 const float GRAVITY_MS2 = 9.80665f;
 
 struct KF1D {
@@ -182,32 +183,34 @@ struct NavState {
 NavState nav;
 
 // ================= FLIGHT GATES =================
-float TAKEOFF_THR_MIN = 1250.0f;     // ga đủ lớn mới xét đang bay
+// NOTE: Điều kiện an toàn để xác nhận drone đã bay và cảm biến đủ tin cậy.
+float TAKEOFF_THR_MIN = 1350.0f;     // ga đủ lớn mới xét đang bay
 float LAND_THR_MAX = 1120.0f;        // ga thấp coi như landed
 
 float AIRBORNE_MIN_Z = 0.20f;        // dưới mức này không cho hold
 float AIRBORNE_MAX_Z = 2.20f;
 
-uint8_t FLOW_MIN_QUALITY = 35;
+uint8_t FLOW_MIN_QUALITY = 45;
 
 uint16_t AIRBORNE_CONFIRM_MS = 400;  // xác nhận airborne có trễ để tránh false trigger
 uint16_t FLOW_GOOD_CONFIRM_MS = 250; // xác nhận quality đủ tốt liên tục
 
 // ================= OPTICAL FLOW COMPENSATION + KF PARAMS =================
+// NOTE: Bù nhiễu flow do drone nghiêng/quay và cấu hình nhiễu Kalman.
 float FLOW_GYRO_ROLL_SIGN = 1.0f;    // đổi dấu nếu khi nghiêng roll mà bù sai chiều
 float FLOW_GYRO_PITCH_SIGN = 1.0f;   // đổi dấu nếu khi nghiêng pitch mà bù sai chiều
-float FLOW_COMP_GAIN = 0.35f;        // gain bù gyro cho flow, tune dần từ 0 -> 1  0.4
-float FLOW_BIAS_ALPHA = 0.004f;      // học bias flow khi chưa bay
-float FLOW_POS_LEAK = 0.0005f;       // xả trôi chậm cho vị trí XY
+float FLOW_COMP_GAIN = 0.0f;        // gain bù gyro cho flow, tune dần từ 0 -> 1  0.4
+float FLOW_BIAS_ALPHA = 0.006f;      // học bias flow khi chưa bay
+float FLOW_POS_LEAK = 0.0002f;       // xả trôi chậm cho vị trí XY
 
-float FLOW_VEL_DEADBAND = 0.025f;    // bỏ nhiễu flow nhỏ
-float FLOW_R_MIN = 0.015f;           // quality cao -> R nhỏ
-float FLOW_R_MAX = 0.120f;           // quality thấp -> R lớn
+float FLOW_VEL_DEADBAND = 0.01f;    // bỏ nhiễu flow nhỏ
+float FLOW_R_MIN = 0.010f;           // quality cao -> R nhỏ
+float FLOW_R_MAX = 0.080f;           // quality thấp -> R lớn
 
 float RANGE_R_MIN = 0.006f;          // ToF quality cao -> R nhỏ
 float RANGE_R_MAX = 0.060f;          // ToF quality thấp -> R lớn
 
-float KF_XY_Q_POS = 0.00002f;
+float KF_XY_Q_POS = 0.000015f;
 float KF_XY_Q_VEL = 0.00150f;
 float KF_Z_Q_POS  = 0.00002f;
 float KF_Z_Q_VEL  = 0.00200f;
@@ -216,31 +219,32 @@ float flow_bias_vx = 0.0f;
 float flow_bias_vy = 0.0f;
 
 // ================= POSITION HOLD XY =================
+// NOTE: Bộ giữ vị trí ngang; vị trí -> vận tốc đặt -> gia tốc -> góc roll/pitch.
 // Vòng ngoài vị trí -> vận tốc đặt, vòng trong vận tốc -> gia tốc -> góc
 float XY_POS_DEADBAND = 0.03f;     // bỏ nhiễu vị trí 6cm
-float XY_MAX_POS = 2.0f;           // giới hạn tích vị trí
+float XY_MAX_POS = 1.5f;           // giới hạn tích vị trí
 
-float XY_POS_P_SMALL = 0.95f;      // gain phi tuyến: lỗi nhỏ   0.55
-float XY_POS_P_MID   = 1.25f;      // gain phi tuyến: lỗi vừa   0.85
-float XY_POS_P_BIG   = 1.45f;      // gain phi tuyến: lỗi lớn   1.15
+float XY_POS_P_SMALL = 0.75f;      // gain phi tuyến: lỗi nhỏ   0.55
+float XY_POS_P_MID   = 1.05f;      // gain phi tuyến: lỗi vừa   0.85
+float XY_POS_P_BIG   = 1.35f;      // gain phi tuyến: lỗi lớn   1.15
 
-float XY_MAX_VEL = 0.35f;          // giới hạn vận tốc đặt
-float XY_VEL_SP_LPF_HZ = 12.0f;    // LPF setpoint vận tốc
+float XY_MAX_VEL = 0.25f;          // giới hạn vận tốc đặt
+float XY_VEL_SP_LPF_HZ = 8.0f;    // LPF setpoint vận tốc
 
-float XY_VEL_P = 0.9f;            // vận tốc lỗi -> gia tốc
+float XY_VEL_P = 0.75f;            // vận tốc lỗi -> gia tốc
 float XY_VEL_I = 0.01f;            // để 0 trước tránh tự bò góc do flow bias
-float XY_I_LIMIT = 0.18f;          // gioi han tich phan , don vi gan m/s2
-float XY_VEL_D = 0.06f;
-float XY_D_FILTER_HZ = 15.0f;      // Lọc D để đỡ nhiễu
+float XY_I_LIMIT = 0.05f;          // gioi han tich phan , don vi gan m/s2
+float XY_VEL_D = 0.025f;
+float XY_D_FILTER_HZ = 8.0f;      // Lọc D để đỡ nhiễu
 
-float XY_MAX_ACCEL = 0.5f;        // tăng nhẹ để pitch có lực hơn
+float XY_MAX_ACCEL = 0.35;     // tăng nhẹ để pitch có lực hơn
 float XY_MAX_ANGLE = 2.0f;         // giữ lại, dùng như giá trị tham khảo
 
-float XY_ROLL_HOLD_GAIN  = 1.5f;   // trái/phải đang ổn, giữ nguyên
-float XY_PITCH_HOLD_GAIN = 6.5f;   // tăng riêng trục tiến/lùi
+float XY_ROLL_HOLD_GAIN  = 1.3f;   // trái/phải đang ổn, giữ nguyên
+float XY_PITCH_HOLD_GAIN = 2.0f;   // tăng riêng trục tiến/lùi
 
-float XY_MAX_ROLL_ANGLE  = 4.0f;   // roll giữ như cũ
-float XY_MAX_PITCH_ANGLE = 5.0f;   // pitch cho mạnh hơn
+float XY_MAX_ROLL_ANGLE  = 3.0f;   // roll giữ như cũ
+float XY_MAX_PITCH_ANGLE = 4.0f;   // pitch cho mạnh hơn
 
 int XY_POS_LOOP_DIV = 5;           // outer loop chạy chậm hơn inner loop
 
@@ -255,23 +259,38 @@ float xy_d_y_fil = 0.0f;
 int xy_outer_loop_counter = 0;
 
 // ================= ALT HOLD Z =================
+// NOTE: Bộ giữ độ cao; độ cao -> vận tốc leo/hạ -> bù throttle.
 // Outer loop: altitude -> climb rate, inner loop: climb rate -> throttle correction
-float ALT_DEADBAND = 0.04f;
+float ALT_DEADBAND = 0.03f;
 
 float ALT_POS_P_SMALL = 0.75f;
 float ALT_POS_P_MID   = 1.05f;
 float ALT_POS_P_BIG   = 1.35f;
 
-float ALT_MAX_CLIMB_RATE = 0.22f;
-float ALT_TARGET_VZ_LPF_HZ = 10.0f;
+float ALT_MAX_CLIMB_RATE = 0.2f;
+float ALT_TARGET_VZ_LPF_HZ = 8.0f;
 
 float ALT_VEL_P = 170.0f;
-float ALT_VEL_I = 1.0f;
+float ALT_VEL_I = 1.3f;
 float ALT_VEL_D = 10.0f;
-float ALT_D_FILTER_HZ = 12.0f;
+float ALT_D_FILTER_HZ = 8.0f;
 
 float ALT_MAX_CORRECTION = 170.0f;
-float ALT_OUTPUT_SLEW = 150.0f;   //giam toc do thay doi ga
+float ALT_OUTPUT_SLEW = 170.0f;   //giam toc do thay doi ga
+
+// ================= AUTO LAND =================
+// MTF02 của mày cách mặt đất khoảng 16cm khi chân chạm đất.
+// Vì vậy không đợi nav.z về 0.
+float LAND_TOUCH_Z = 0.20f;          // <=20cm coi là gần chạm/chạm đất
+float LAND_SLOW_ALT = 0.60f;
+float LAND_FINAL_ALT = 0.35f;
+
+float LAND_DESCENT_FAST  = -0.05f;   // 8 cm/s
+float LAND_DESCENT_SLOW  = -0.03f;   // 4 cm/s
+float LAND_DESCENT_FINAL = -0.020f;  // 2 cm/s
+
+float LAND_MAX_CORRECTION = 90.0f;   // landing không cho PID giật ga quá mạnh
+float LAND_OUTPUT_SLEW    = 45.0f;   // PWM/s, ga thay đổi chậm khi land
 
 float alt_target_vz_fil = 0.0f;
 float alt_i = 0.0f;
@@ -280,6 +299,7 @@ float alt_d_fil = 0.0f;
 float alt_output_limited = 0.0f;
 
 // ================= BMP280 BACKUP =================
+// NOTE: BMP280 dùng làm backup khi MTF02 không dùng được cho giữ cao.
 float ground_pressure = 0.0f;
 uint8_t barometer_counter = 0;
 float P = 0.0f;
@@ -340,6 +360,7 @@ float ALT_OUTPUT_SLEW_OLD = 0.0f;
 float pid_output_altitude_limited = 0.0f;
 
 // ================= RAW IMU GLOBAL =================
+// NOTE: Biến raw IMU để debug/gửi UDP về laptop.
 int16_t imu_ax = 0;
 int16_t imu_ay = 0;
 int16_t imu_az = 0;
@@ -348,6 +369,7 @@ int16_t imu_gy = 0;
 int16_t imu_gz = 0;
 
 // ================= HELPERS =================
+// NOTE: Hàm phụ dùng chung: wrap góc, low-pass theo tần số cắt.
 float wrapPi(float a) {
   while (a > PI) a -= 2.0f * PI;
   while (a < -PI) a += 2.0f * PI;
@@ -362,6 +384,7 @@ float lowPassHz(float input, float prev, float cut_off_hz, float dt) {
 }
 
 // ================= SAFE IMU READ =================
+// NOTE: Đọc 14 byte IMU an toàn, trả false nếu I2C lỗi.
 bool readICMRaw(
   int16_t &ax,
   int16_t &ay,
@@ -394,6 +417,7 @@ bool readICMRaw(
 }
 
 // ================= KF HELPERS =================
+// NOTE: Các hàm Kalman predict/update cho vị trí và vận tốc.
 void kfReset(KF1D &kf, float pos0, float vel0) {
   kf.pos = pos0;
   kf.vel = vel0;
@@ -473,6 +497,7 @@ float qualityToRRange(uint8_t q) {
 }
 
 // ================= OPTICAL FLOW / RANGE HELPERS =================
+// NOTE: Bù tilt cho độ cao MTF02 vì cảm biến đo theo phương của thân drone.
 float getTiltCompensatedHeight() {
   float cr = cosf(roll_f * DEG_TO_RAD);
   float cp = cosf(pitch_f * DEG_TO_RAD);
@@ -481,6 +506,7 @@ float getTiltCompensatedHeight() {
 }
 
 // ================= MTF02 MSP V2 READ =================
+// NOTE: Parser gói MSP V2 của MTF02, lấy range và optical flow.
 int32_t readI32LE(uint8_t *p) {
   uint32_t v =
     ((uint32_t)p[0]) |
@@ -523,57 +549,16 @@ void readMTF02() {
     uint8_t c = SerialMTF.read();
 
     switch (state) {
-      case 0:
-        if (c == 0x24) state = 1;
-        break;
-
-      case 1:
-        if (c == 0x58) state = 2;
-        else state = 0;
-        break;
-
-      case 2:
-        if (c == 0x3C) state = 3;
-        else state = 0;
-        break;
-
-      case 3:
-        state = 4;
-        break;
-
-      case 4:
-        msg_id = c;
-        state = 5;
-        break;
-
-      case 5:
-        msg_id |= (c << 8);
-        state = 6;
-        break;
-
-      case 6:
-        payload_size = c;
-        state = 7;
-        break;
-
-      case 7:
-        if (payload_size > 0 && payload_size <= 16) {
-          payload_idx = 0;
-          state = 8;
-        } else {
-          state = 0;
-        }
-        break;
-
-      case 8:
-        payload[payload_idx++] = c;
-        if (payload_idx >= payload_size) state = 9;
-        break;
-
-      case 9:
-        if (msg_id == 0x1F01 && payload_size == 5) {
-          mtf_quality = payload[0];
-
+      case 0:if (c == 0x24) state = 1;break;
+      case 1:if (c == 0x58) state = 2;else state = 0;break;
+      case 2:if (c == 0x3C) state = 3;else state = 0;break;
+      case 3:state = 4;break;
+      case 4:msg_id = c;state = 5;break;
+      case 5:msg_id |= (c << 8);state = 6;break;
+      case 6:payload_size = c;state = 7;break;
+      case 7:if (payload_size > 0 && payload_size <= 16) {payload_idx = 0;state = 8;} else {state = 0;}break;
+      case 8:payload[payload_idx++] = c;if (payload_idx >= payload_size) state = 9;break;
+      case 9:if (msg_id == 0x1F01 && payload_size == 5) {mtf_quality = payload[0];
           int32_t dist_mm = readI32LE(&payload[1]);
           mtf_distance = (float)dist_mm / 1000.0f;
         }
@@ -597,14 +582,13 @@ void readMTF02() {
 
           pushFlowMovingAverage(mtf_vel_x_fil, mtf_vel_y_fil);  // theo báo cáo: moving-average 8 mẫu
         }
-
         state = 0;
         break;
     }
   }
 }
-
 // ================= NAV ESTIMATOR =================
+// NOTE: Ước lượng trạng thái bay x/y/z/vx/vy/vz và kiểm tra flow/range hợp lệ.
 void resetXYEstimator() {
   kfReset(kf_x, 0.0f, 0.0f);
   kfReset(kf_y, 0.0f, 0.0f);
@@ -773,6 +757,7 @@ if (!nav.flow_ok) {
 }
 
 // ================= CONTROLLERS =================
+// NOTE: Gồm computeXYHold() và computeAltHoldMTF02().
 void computeXYHold(float dt, float &roll_out, float &pitch_out) {
   roll_out = r_set;
   pitch_out = p_set;
@@ -780,9 +765,11 @@ void computeXYHold(float dt, float &roll_out, float &pitch_out) {
   bool xy_hold_active = (
     nav.airborne &&
     nav.flow_ok &&
+    nav.z > 0.40f &&
     flight_mode == 1 &&
     is_armed_int == 1 &&
-    pos_hold_flag == 1
+    pos_hold_flag == 1 &&
+    auto_land_flag == 0
   );
 
   if (!xy_hold_active) {
@@ -799,27 +786,23 @@ void computeXYHold(float dt, float &roll_out, float &pitch_out) {
     xy_outer_loop_counter = 0;
     return;
   }
+if (!nav.xy_hold_ready) {
+  nav.target_x = nav.x;
+  nav.target_y = nav.y;
 
-  // Vừa bật hold: khóa vị trí hiện tại làm target
-  if (!xy_hold_active) {
-  // Chỉ reset target khi thật sự thoát hold:
-  // disarm, tắt H, hoặc Python báo không hold.
-  if (is_armed_int == 0 || flight_mode != 1 || pos_hold_flag == 0) {
-    nav.xy_hold_ready = false;
-
-    xy_target_vx_fil = 0.0f;
-    xy_target_vy_fil = 0.0f;
-    xy_i_x = 0.0f;
-    xy_i_y = 0.0f;
-  }
-
+  xy_target_vx_fil = 0.0f;
+  xy_target_vy_fil = 0.0f;
+  xy_i_x = 0.0f;
+  xy_i_y = 0.0f;
   xy_last_vel_err_x = 0.0f;
   xy_last_vel_err_y = 0.0f;
   xy_d_x_fil = 0.0f;
   xy_d_y_fil = 0.0f;
   xy_outer_loop_counter = 0;
 
-  return;
+  nav.xy_hold_ready = true;
+
+  Serial.printf("[XY HOLD] LOCK X=%.2f Y=%.2f\n", nav.target_x, nav.target_y);
 }
 
   float pos_err_x = nav.target_x - nav.x;
@@ -906,22 +889,27 @@ void computeXYHold(float dt, float &roll_out, float &pitch_out) {
   float acc_body_x = cy * acc_ref_x + sy * acc_ref_y;   // RF -> BF
   float acc_body_y = -sy * acc_ref_x + cy * acc_ref_y;  // RF -> BF
 
-  // Báo cáo dùng asin(u*m/T), ở đây gần đúng T≈mg nên atan2(acc/g) ổn định và đơn giản hơn
+  // ở đây gần đúng T≈mg nên atan2(acc/g) ổn định và đơn giản hơn
   float pitch_cmd = atan2f(acc_body_x, GRAVITY_MS2) * 57.2957795f * XY_PITCH_HOLD_GAIN;
   float roll_cmd  = atan2f(acc_body_y, GRAVITY_MS2) * 57.2957795f * XY_ROLL_HOLD_GAIN;
 
-  pitch_out = constrain(pitch_cmd, -XY_MAX_PITCH_ANGLE, XY_MAX_PITCH_ANGLE);
+  pitch_out = constrain(-pitch_cmd, -XY_MAX_PITCH_ANGLE, XY_MAX_PITCH_ANGLE);
   roll_out  = constrain(roll_cmd,  -XY_MAX_ROLL_ANGLE, XY_MAX_ROLL_ANGLE);
 }
 
 bool computeAltHoldMTF02(float dt) {
-  bool alt_hold_active = (
-    nav.airborne &&
-    nav.range_ok &&
-    flight_mode == 1 &&
-    is_armed_int == 1 &&
-    mtf_quality > 30
-  );
+bool alt_sensor_ok = (
+  nav.range_ok ||
+  (auto_land_flag == 1 && mtf_distance > 0.02f && mtf_distance < 2.20f)
+);
+
+bool alt_hold_active = (
+  (nav.airborne || auto_land_flag == 1) &&
+  alt_sensor_ok &&
+  is_armed_int == 1 &&
+  mtf_quality > 30 &&
+  (flight_mode == 1 || auto_land_flag == 1)
+);
 
   if (!alt_hold_active) {
     nav.z_hold_ready = false;
@@ -936,27 +924,65 @@ bool computeAltHoldMTF02(float dt) {
 
   if (!nav.z_hold_ready) {
     nav.target_z = nav.z;  // khóa độ cao hiện tại khi vừa bật hold
-
     alt_target_vz_fil = 0.0f;
     alt_i = 0.0f;
     alt_last_vz_err = 0.0f;
     alt_d_fil = 0.0f;
     alt_output_limited = 0.0f;
-
     nav.z_hold_ready = true;
   }
 
   // Stick throttle chỉ đổi climb-rate, không đổi trực tiếp PWM; đỡ giật cao độ
-  float stick_climb_rate = 0.0f;
-
-  if (throttle > 1550.0f) {
-    stick_climb_rate = (throttle - 1550.0f) / 450.0f * ALT_MAX_CLIMB_RATE;
-  } else if (throttle < 1450.0f) {
-    stick_climb_rate = (throttle - 1450.0f) / 450.0f * ALT_MAX_CLIMB_RATE;
+float stick_climb_rate = 0.0f;
+// ================= AUTO LAND =================
+// Khi vừa bấm C: KHÔNG reset hover_throttle, KHÔNG reset alt_i,
+// KHÔNG reset alt_output_limited. Chỉ khóa target_z tại độ cao hiện tại,
+// rồi kéo target_z xuống từ từ.
+static int last_auto_land_flag_local = 0;
+if (auto_land_flag == 1 && last_auto_land_flag_local == 0) {
+  nav.target_z = nav.z;
+  alt_target_vz_fil = 0.0f;
+  alt_last_vz_err = 0.0f;
+  alt_d_fil = 0.0f;
+  // CỰC QUAN TRỌNG:
+  // Không reset alt_i.
+  // Không reset alt_output_limited.
+  // Không đổi hover_throttle.
+  //Serial.printf("[LAND] START Z=%.2f TARGET=%.2f HOVER=%.0f OUT=%.1f\n",
+  //              nav.z, nav.target_z, hover_throttle, alt_output_limited);
+}
+last_auto_land_flag_local = auto_land_flag;
+if (auto_land_flag == 1) {
+  if (nav.z > LAND_SLOW_ALT) {
+    stick_climb_rate = LAND_DESCENT_FAST;       // cao hơn 60cm: hạ 8cm/s
   }
+  else if (nav.z > LAND_FINAL_ALT) {
+    stick_climb_rate = LAND_DESCENT_SLOW;       // 35–60cm: hạ 4cm/s
+  }
+  else if (nav.z > LAND_TOUCH_Z) {
+    stick_climb_rate = LAND_DESCENT_FINAL;      // 22–35cm: hạ 2cm/s
+  }
+  else {
+    stick_climb_rate = 0.0f;                    // gần đất: không kéo xuống nữa
+  }
+}
+else {
+  // ================= ĐIỀU KHIỂN ĐỘ CAO BẰNG PHÍM I/K =================
+  if (throttle > 1550.0f) {
+    stick_climb_rate =(throttle - 1550.0f) /450.0f *ALT_MAX_CLIMB_RATE;}
 
-  nav.target_z += stick_climb_rate * dt;
-  nav.target_z = constrain(nav.target_z, 0.30f, 1.80f);
+  else if (throttle < 1450.0f) {stick_climb_rate =(throttle - 1450.0f) /450.0f *ALT_MAX_CLIMB_RATE;
+  }
+}
+
+nav.target_z += stick_climb_rate * dt;
+
+// Khi land cho phép target xuống thấp hơn 30cm
+if (auto_land_flag == 1) {
+  nav.target_z = constrain(nav.target_z, 0.22f, 2.0f);
+} else {
+  nav.target_z = constrain(nav.target_z, 0.20f, 2.0f);
+}
 
   float alt_err = nav.target_z - nav.z;
   if (fabsf(alt_err) < ALT_DEADBAND) alt_err = 0.0f;
@@ -973,20 +999,17 @@ bool computeAltHoldMTF02(float dt) {
   float vz_err = alt_target_vz_fil - nav.vz;
 
   alt_i += vz_err * dt;
-  alt_i = constrain(alt_i, -1.5f, 1.5f);
+  alt_i = constrain(alt_i, -45.0f, 45.0f);
 
   float d_vz_raw = (vz_err - alt_last_vz_err) / dt;
   alt_d_fil = lowPassHz(d_vz_raw, alt_d_fil, ALT_D_FILTER_HZ, dt);
   alt_last_vz_err = vz_err;
 
-  float raw_out =
-    ALT_VEL_P * vz_err +
-    ALT_VEL_I * alt_i +
-    ALT_VEL_D * alt_d_fil;
-
-  raw_out = constrain(raw_out, -ALT_MAX_CORRECTION, ALT_MAX_CORRECTION);
-
-  float max_step = ALT_OUTPUT_SLEW * dt;  // slew limit để ga không nhảy đột ngột
+  float raw_out =ALT_VEL_P * vz_err + ALT_VEL_I * alt_i + ALT_VEL_D * alt_d_fil;
+float max_corr = (auto_land_flag == 1) ? LAND_MAX_CORRECTION : ALT_MAX_CORRECTION;
+float max_slew = (auto_land_flag == 1) ? LAND_OUTPUT_SLEW    : ALT_OUTPUT_SLEW;
+raw_out = constrain(raw_out, -max_corr, max_corr);
+float max_step = max_slew * dt;  // slew limit để ga không tụt/nhảy đột ngột
   if (raw_out > alt_output_limited + max_step) {
     alt_output_limited += max_step;
   } else if (raw_out < alt_output_limited - max_step) {
@@ -1006,6 +1029,7 @@ bool computeAltHoldMTF02(float dt) {
 }
 
 // ================= MOTOR =================
+// NOTE: Xuất PWM microsecond ra ESC qua LEDC.
 void writeMotor(int ch, int us) {
   us = constrain(us, 1000, 2000);
   uint32_t duty = (us * 16384) / 20000;
@@ -1013,6 +1037,7 @@ void writeMotor(int ch, int us) {
 }
 
 // ================= WEB PID =================
+// NOTE: Web chỉnh nhanh PID roll/pitch/yaw qua trình duyệt.
 void handleRoot() {
   char html[1600];
 
@@ -1068,12 +1093,13 @@ void handleUpdate() {
 }
 
 // ================= IMU CALIB =================
+// NOTE: Calib gyro/acc lúc khởi động; bắt buộc để drone đứng yên.
 void calibrateIMU() {
   Serial.println("\n[SYSTEM] DANG CALIBRATE IMU... DE YEN DRONE");
 
   int valid_samples = 0;
 
-  while (valid_samples < 500) {
+  while (valid_samples < 1000) {
     int16_t ax, ay, az, gx, gy, gz;
 
     if (readICMRaw(ax, ay, az, gx, gy, gz)) {
@@ -1090,12 +1116,12 @@ void calibrateIMU() {
     delay(4);
   }
 
-  gyro_x_cal /= 500.0f;
-  gyro_y_cal /= 500.0f;
-  gyro_z_cal /= 500.0f;
+  gyro_x_cal /= 1000.0f;
+  gyro_y_cal /= 1000.0f;
+  gyro_z_cal /= 1000.0f;
 
-  acc_roll_cal /= 500.0f;
-  acc_pitch_cal /= 500.0f;
+  acc_roll_cal /= 1000.0f;
+  acc_pitch_cal /= 1000.0f;
 
   // reset toàn bộ filter sau calib để triệt giá trị cũ
   kalman_roll = 0.0f;
@@ -1125,6 +1151,7 @@ void calibrateIMU() {
 }
 
 // ================= COMM TASK CORE 0 =================
+// NOTE: Task chạy song song core 0: nhận UDP, xử lý H/land/failsafe, chuyển lidar về laptop.
 void CommTask(void *pv) {
   uint8_t lidar_buf[512];
 
@@ -1149,15 +1176,7 @@ void CommTask(void *pv) {
         // parse 8 trường UDP: throttle, roll, pitch, yaw, arm, H, auto_land, pos_hold
         int parsed = sscanf(
           buf,
-          "%f,%f,%f,%f,%d,%d,%d,%d",
-          &temp_throttle,
-          &r_set,
-          &p_set,
-          &y_set,
-          &arm_cmd,
-          &flight_mode,
-          &auto_land_flag,
-          &pos_hold_flag
+          "%f,%f,%f,%f,%d,%d,%d,%d",&temp_throttle,&r_set,&p_set,&y_set,&arm_cmd,&flight_mode,&auto_land_flag,&pos_hold_flag
         );
 
         if (parsed == 8) {
@@ -1167,6 +1186,21 @@ void CommTask(void *pv) {
             if (temp_throttle <= 1050.0f) {
               is_armed_int = 1;
               Serial.println("[UDP] ARM OK");
+              r_i = 0.0f; p_i = 0.0f; y_i = 0.0f;
+              r_prev_rate_e = 0.0f; p_prev_rate_e = 0.0f; y_prev_rate_e = 0.0f;
+              r_d_fil = 0.0f; p_d_fil = 0.0f; y_d_fil = 0.0f;
+
+              alt_i = 0.0f;
+              alt_last_vz_err = 0.0f;
+              alt_d_fil = 0.0f;
+              alt_output_limited = 0.0f;
+
+              xy_i_x = 0.0f;
+              xy_i_y = 0.0f;
+              xy_last_vel_err_x = 0.0f;
+              xy_last_vel_err_y = 0.0f;
+              xy_d_x_fil = 0.0f;
+              xy_d_y_fil = 0.0f;
             } else {
               Serial.println("[UDP] ARM REJECT - throttle high");
             }
@@ -1179,11 +1213,13 @@ void CommTask(void *pv) {
             auto_land_flag = 0;
             Serial.println("[UDP] DISARM OK");
           }
-
-          if (auto_land_flag == 0) {
-            throttle = temp_throttle;
-          }
-
+if (auto_land_flag == 0) {
+  throttle = temp_throttle;
+} else {
+  // Khi AUTO LAND, throttle từ Python không dùng làm ga thật
+  // computeAltHoldMTF02 sẽ tự xử lý hạ cánh
+  throttle = 1500.0f;
+}
           // Serial.printf(
           //   "[UDP] T:%4.0f R:%5.2f P:%5.2f Y:%5.2f ARM:%d FM:%d LAND:%d HOLD:%d\n",
           //   throttle, r_set, p_set, y_set, is_armed_int, flight_mode, auto_land_flag, pos_hold_flag
@@ -1192,38 +1228,78 @@ void CommTask(void *pv) {
       }
     }
 
-    if (auto_land_flag == 1 || (millis() - last_cmd_time > 1000)) {
-      r_set = 0.0f;
-      p_set = 0.0f;
-      y_set = 0.0f;
+bool failsafe_lost_cmd = (millis() - last_cmd_time > 1000);
+
+// ================= AUTO LAND =================
+if (auto_land_flag == 1) {
+  // Không cho lái tay/RViz can thiệp khi đang land
+  r_set = 0.0f;
+  p_set = 0.0f;
+  y_set = 0.0f;
+
+  // LAND vẫn dùng altitude controller
+  flight_mode = 1;
+
+  // Trung tâm stick độ cao, computeAltHoldMTF02 sẽ tự tạo vận tốc hạ
+  throttle = 1500.0f;
+
+  // Gần đất: MTF02 tính bằng mét
+bool near_ground = (mtf_distance > 0.02f && mtf_distance < LAND_TOUCH_Z);
+
+  // Nếu có nav.vz thì kiểm tra thêm vận tốc nhỏ
+  bool vz_slow = fabsf(nav.vz) < 0.18f;
+
+  // Chỉ disarm khi thật sự gần đất và giữ 1.5 giây
+  if (near_ground && vz_slow) {
+    if (ground_touch_time == 0) {
+      ground_touch_time = millis();
+    } else if (millis() - ground_touch_time > 1500) {
+      throttle = 1000.0f;
+      is_armed_int = 0;
+      auto_land_flag = 0;
       flight_mode = 0;
-
-      if (millis() - last_failsafe_tick > 200) {
-        throttle -= 1.0f;
-        last_failsafe_tick = millis();
-      }
-
-      if (throttle < (hover_throttle - 80.0f) && abs(parachute_throttle) < 15) {
-        if (ground_touch_time == 0) {
-          ground_touch_time = millis();
-        } else if (millis() - ground_touch_time > 1000) {
-          throttle = 1000.0f;
-          is_armed_int = 0;
-          auto_land_flag = 0;
-          ground_touch_time = 0;
-        }
-      } else {
-        ground_touch_time = 0;
-      }
-
-      if (throttle <= 1050.0f) {
-        throttle = 1000.0f;
-        is_armed_int = 0;
-        auto_land_flag = 0;
-        ground_touch_time = 0;
-      }
+      ground_touch_time = 0;
+      Serial.println("[LAND] TOUCHDOWN - DISARM");
     }
+  } else {
+    ground_touch_time = 0;
+  }
+}
 
+// ================= FAILSAFE MẤT LỆNH =================
+// Cái này mới giảm ga trực tiếp, chỉ dùng khi mất UDP.
+else if (failsafe_lost_cmd) {
+  r_set = 0.0f;
+  p_set = 0.0f;
+  y_set = 0.0f;
+  flight_mode = 0;
+
+  if (millis() - last_failsafe_tick > 200) {
+    throttle -= 1.0f;
+    last_failsafe_tick = millis();
+  }
+
+  bool near_ground = (mtf_distance > 0.02f && mtf_distance < 0.12f);
+
+  if (near_ground && throttle <= 1120.0f) {
+    if (ground_touch_time == 0) {
+      ground_touch_time = millis();
+    } else if (millis() - ground_touch_time > 1500) {
+      throttle = 1000.0f;
+      is_armed_int = 0;
+      auto_land_flag = 0;
+      flight_mode = 0;
+      ground_touch_time = 0;
+      Serial.println("[FAILSAFE] TOUCHDOWN - DISARM");
+    }
+  } else {
+    ground_touch_time = 0;
+  }
+
+  if (!near_ground && throttle < 1120.0f) {
+    throttle = 1120.0f;
+  }
+}
     int availableBytes = Serial2.available();
 
     if (availableBytes >= 100) {
@@ -1242,6 +1318,7 @@ void CommTask(void *pv) {
 }
 
 // ================= SETUP =================
+// NOTE: Khởi tạo toàn bộ phần cứng và tạo task giao tiếp.
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -1250,81 +1327,52 @@ void setup() {
   Wire.setTimeOut(20);
 
   // Wake up sensor
-  Wire.beginTransmission(ICM_ADDR);
-  Wire.write(0x6B);
-  Wire.write(0x00);
-  Wire.endTransmission();
-
-  // Gyro/acc DLPF như code gốc
-  Wire.beginTransmission(ICM_ADDR);
-  Wire.write(0x1A);
-  Wire.write(0x06);
-  Wire.endTransmission();
-
-  Wire.beginTransmission(ICM_ADDR);
-  Wire.write(0x1D);
-  Wire.write(0x06);
-  Wire.endTransmission();
+  Wire.beginTransmission(ICM_ADDR);Wire.write(0x6B);Wire.write(0x00);Wire.endTransmission();
+  // Gyro/acc DLPF 
+  Wire.beginTransmission(ICM_ADDR);Wire.write(0x1A);Wire.write(0x06);Wire.endTransmission();
+  Wire.beginTransmission(ICM_ADDR);Wire.write(0x1D);Wire.write(0x06);Wire.endTransmission();
 
   calibrateIMU();
-
   SerialMTF.begin(115200, SERIAL_8N1, MTF02_RX_PIN, MTF02_TX_PIN);
-
   bmp = new Adafruit_BMP280(&Wire);
-
   if (!bmp->begin(0x76)) {
     Serial.println("[BMP280] 0x76 FAIL, TRY 0x77");
     bmp->begin(0x77);
   }
-
   delay(100);
-
   float init_p = bmp->readPressure();
-
   for (int i = 0; i < 20; i++) {
     pressure_rotating_mem[i] = (int32_t)init_p;
   }
-
   pressure_total_avarage = (int32_t)(init_p * 20.0f);
   actual_pressure_slow = init_p;
   actual_pressure_fast = init_p;
   ground_pressure = init_p;
-
   for (int i = 0; i < 4; i++) {
     ledcSetup(i, 50, 14);
-
     int p = (i == 0) ? M1_PIN : (i == 1) ? M2_PIN : (i == 2) ? M3_PIN : M4_PIN;
-
     ledcAttachPin(p, i);
     writeMotor(i, 1000);
   }
-
   Serial2.begin(115200, SERIAL_8N1, LIDAR_RX, -1);
-
   ledcSetup(4, 10000, 8);
   ledcAttachPin(LIDAR_MOT, 4);
   ledcWrite(4, 50);
-
   WiFi.softAP(ssid, password);
-
   server.on("/", HTTP_GET, handleRoot);
   server.on("/update", HTTP_GET, handleUpdate);
   server.begin();
-
   udp_cmd.begin(8888);
-
   delay(1000);
-
   last_cmd_time = millis();
   timer = micros();
   last_debug_time = millis();
-
   xTaskCreatePinnedToCore(CommTask, "Comm", 8192, NULL, 1, NULL, 0);
-
   Serial.println("[SYSTEM] READY");
 }
 
 // ================= LOOP 250Hz =================
+// NOTE: Vòng bay chính 250Hz: đọc sensor -> estimator -> PID -> mixer -> motor.
 void loop() {
   unsigned long loop_start = micros();
 
@@ -1335,19 +1383,20 @@ void loop() {
     dt = 0.004f;
   }
 
-  static float final_throttle = 1000.0f;
+static float final_throttle = 1000.0f;
+static float throttle_smooth = 1000.0f;
 
-  readMTF02();
+const float THROTTLE_RAMP_UP = 450.0f;     // PWM/s
+const float THROTTLE_RAMP_DOWN = 550.0f;   // PWM/s
 
+readMTF02();
   // ===== IMU READ + FILTER =====
   int16_t ax, ay, az, gx, gy, gz;
   bool imu_ok = readICMRaw(ax, ay, az, gx, gy, gz);
-
   if (!imu_ok) {
     while (micros() - loop_start < 4000) { }
     return;
   }
-
   imu_ax = ax;
   imu_ay = ay;
   imu_az = az;
@@ -1375,7 +1424,6 @@ void loop() {
 
   acc_r_fil = acc_r_fil * (1.0f - ACC_LPF_ALPHA) + acc_r_raw * ACC_LPF_ALPHA;
   acc_p_fil = acc_p_fil * (1.0f - ACC_LPF_ALPHA) + acc_p_raw * ACC_LPF_ALPHA;
-
   // ===== COMPLEMENTARY FILTER ROLL/PITCH =====
   // Thay Kalman cũ bằng complementary filter để accel kéo drift gyro tốt hơn
   float rate_r_angle = rate_r;
@@ -1411,14 +1459,34 @@ void loop() {
   updateNavEstimator(dt);
 
   // ===== XY HOLD =====
-  float final_r_set = r_set;
-  float final_p_set = p_set;
+float final_r_set = r_set;
+float final_p_set = p_set;
+computeXYHold(dt, final_r_set, final_p_set);
 
-  computeXYHold(dt, final_r_set, final_p_set);
+// Cộng Trim sau khi đã có lệnh góc (manual hoặc hold)
+if (is_armed_int == 1 && throttle > 1150.0f) {
+  final_r_set += ROLL_TRIM_DEG;
+  final_p_set += PITCH_TRIM_DEG;
+}
+// Giới hạn tổng góc sau trim
+final_r_set = constrain(final_r_set, -12.0f, 12.0f);
+final_p_set = constrain(final_p_set, -12.0f, 12.0f);
 
-  float r_target_rate = constrain((final_r_set - roll_f) * Kp_angle_rp, -100.0f, 100.0f);
-  float p_target_rate = constrain((final_p_set - pitch_f) * Kp_angle_rp, -100.0f, 100.0f);
+// Làm mượt lệnh góc (low-pass filter)
+static float final_r_set_smooth = 0.0f;
+static float final_p_set_smooth = 0.0f;
+if (is_armed_int == 0 || throttle < 1100.0f) {
+    final_r_set_smooth = 0.0f;
+    final_p_set_smooth = 0.0f;
+} else {
+    final_r_set_smooth = lowPassHz(final_r_set, final_r_set_smooth, 4.0f, dt);
+    final_p_set_smooth = lowPassHz(final_p_set, final_p_set_smooth, 4.0f, dt);
+}
+final_r_set = final_r_set_smooth;
+final_p_set = final_p_set_smooth;
 
+float r_target_rate = constrain((final_r_set - roll_f) * Kp_angle_rp, -100.0f, 100.0f);
+float p_target_rate = constrain((final_p_set - pitch_f) * Kp_angle_rp, -100.0f, 100.0f);
   // ===== BMP280 FILTER =====
   barometer_counter++;
 
@@ -1473,7 +1541,7 @@ void loop() {
       bool mtf_alt_used = computeAltHoldMTF02(dt);
 
       if (!mtf_alt_used) {
-        // Nhánh backup giữ cao bằng BMP280 giữ nguyên cấu trúc cũ
+        // Nhánh backup giữ cao bằng BMP280
         if (pid_altitude_setpoint == 0.0f) {
           pid_altitude_setpoint = actual_pressure;
         }
@@ -1552,34 +1620,12 @@ void loop() {
       "\nRawZ:%.2f Z:%.2f VZ:%.2f ZT:%.2f OUT:%5.1f "
       "\nVRawX:%.3f VRawY:%.3f VX:%.3f VY:%.3f X:%.2f Y:%.2f TX:%.2f TY:%.2f "
       "\nBvx:%.3f Bvy:%.3f ACC:%.2f TRUST:%d\n",
-      is_armed_int,
-      flight_mode,
-      nav.airborne,
-      nav.flow_ok,
-      pos_hold_flag,
-      mtf_quality,
-      roll_f,
-      pitch_f,
-      yaw_est * 57.2957795f,
-      final_r_set,
-      final_p_set,
-      mtf_distance,
-      nav.z,
-      nav.vz,
-      nav.target_z,
-      pid_output_altitude,
-      mtf_vel_x,
-      mtf_vel_y,
-      nav.vx,
-      nav.vy,
-      nav.x,
-      nav.y,
-      nav.target_x,
-      nav.target_y,
-      flow_bias_vx,
-      flow_bias_vy,
-      acc_norm,
-      acc_trusted ? 1 : 0
+      is_armed_int,flight_mode,nav.airborne,nav.flow_ok,pos_hold_flag,mtf_quality,
+      roll_f,pitch_f,yaw_est * 57.2957795f,
+      final_r_set,final_p_set,
+      mtf_distance,nav.z,nav.vz,nav.target_z,pid_output_altitude,
+      mtf_vel_x,mtf_vel_y,nav.vx,nav.vy,nav.x,nav.y,nav.target_x,nav.target_y,
+      flow_bias_vx,flow_bias_vy,acc_norm,acc_trusted ? 1 : 0
     );
 
     char imu_buf[128];
@@ -1641,32 +1687,29 @@ void loop() {
   static int last_flight_mode = 0;
   final_throttle = 1000.0f;
 
+if (is_armed_int == 0) {
+  throttle_smooth = 1000.0f;
+}
   if (flight_mode == 1) {
     recovering_from_althold = false;
 
-    if (last_flight_mode == 0) {
+    if (last_flight_mode == 0 && auto_land_flag == 0) {
       hover_throttle = throttle;
-
       pid_altitude_setpoint = actual_pressure;
       pid_i_mem_altitude = 0.0f;
-
       pid_output_altitude = 0.0f;
       manual_throttle = 0.0f;
-
       alt_target_vz_fil = 0.0f;
       alt_i = 0.0f;
       alt_last_vz_err = 0.0f;
       alt_d_fil = 0.0f;
       alt_output_limited = 0.0f;
       nav.z_hold_ready = false;
-
       if (!pos_hold_flag) {
         nav.xy_hold_ready = false;
       }
-
       manual_altitude_change = 0;
     }
-
     final_throttle = hover_throttle + pid_output_altitude + manual_throttle;
     final_throttle = constrain(final_throttle, 1100.0f, 1800.0f);
     current_manual_throttle = final_throttle;
@@ -1699,13 +1742,26 @@ void loop() {
     is_armed_int = 0;
     final_throttle = 1000.0f;
   }
+float ramp_up_step = THROTTLE_RAMP_UP * dt;
+float ramp_down_step = THROTTLE_RAMP_DOWN * dt;
 
+if (final_throttle > throttle_smooth + ramp_up_step) {
+  throttle_smooth += ramp_up_step;
+} else if (final_throttle < throttle_smooth - ramp_down_step) {
+  throttle_smooth -= ramp_down_step;
+} else {
+  throttle_smooth = final_throttle;
+}
+
+if (is_armed_int == 0) {
+  throttle_smooth = 1000.0f;
+}
   if (is_armed_int == 1) {
     if (final_throttle > 1050.0f) {
-      writeMotor(0, (int)(final_throttle - p_out + r_out + y_out));
-      writeMotor(1, (int)(final_throttle - p_out - r_out - y_out));
-      writeMotor(2, (int)(final_throttle + p_out + r_out - y_out));
-      writeMotor(3, (int)(final_throttle + p_out - r_out + y_out));
+    writeMotor(0, (int)(throttle_smooth - p_out + r_out + y_out));
+    writeMotor(1, (int)(throttle_smooth - p_out - r_out - y_out));
+    writeMotor(2, (int)(throttle_smooth + p_out + r_out - y_out));
+    writeMotor(3, (int)(throttle_smooth + p_out - r_out + y_out));
     } else {
       if (fabsf(roll_f) < 10.0f && fabsf(pitch_f) < 10.0f) {
         for (int i = 0; i < 4; i++) writeMotor(i, 1050);
